@@ -4,7 +4,7 @@ Independent security patch fork, unaffiliated with ChrisWareOffline and sc-offli
 Given contributors are affiliated with Griefernet, this repository is created only for future audits and patches to ensure nothing malicious happens.
 
 >[!IMPORTANT]
->**I give no guarantee everything is safe**, i made this fork just to **TRY** make sure what original contributors/**Griefernet don't put users in danger.**
+>**I give no guarantee everything is safe**, i made this fork just to **TRY** make sure original contributors/**Griefernet don't put users in danger.**
 >You are welcome to try and help.
 
 **An offline, single-player mod menu for Star Citizen.** Spawn ships, NPCs and buildings, travel the star systems and wear Squadron 42 outfits from one in-game menu.
@@ -15,6 +15,7 @@ Given contributors are affiliated with Griefernet, this repository is created on
 > [!IMPORTANT]
 > **This repository publishes no releases and no prebuilt binaries.** Clone it, read it, and [build it yourself](#build-it-yourself). Don't run a `dinput8.dll` or `sc-offline.exe` unless built locally. 
 > Repo analysis encouraged, don't run or build code that was not verified to be safe.
+> If more people contribute or review changes, and the project is farther ahead, we can introduce review process and publish releases. Without that, i believe this defeats the point of the repo.
 
 ## Disclosure
 
