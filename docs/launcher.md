@@ -5,7 +5,7 @@ The launcher starts the game with the mod and takes the mod out again when the g
 ## Commands
 
 ```text
-sc-offline.exe [play|install|uninstall|status|update|help] [--game <folder>] [--dry-run] [--skip-eac-check]
+sc-offline.exe [play|install|uninstall|status|help] [--game <folder>] [--dry-run] [--skip-eac-check]
 ```
 
 | Command | What it does |
@@ -14,7 +14,6 @@ sc-offline.exe [play|install|uninstall|status|update|help] [--game <folder>] [--
 | `install` | Copies the mod in and leaves it there, for starting the game some other way. Run `uninstall` before going online. |
 | `uninstall` | Takes the mod out, puts back anything it replaced, and undoes leftover [PC changes](#pc-changes). Refuses while the game is running. |
 | `status` | Runs the checks below and changes nothing. |
-| `update` | Checks GitHub for a newer sc-offline and offers to install it; see [Updates](#updates). |
 | `help` | Prints the usage. |
 
 | Option | Meaning |
@@ -44,8 +43,7 @@ It refreshes every 1.5 seconds, including while **Play** is running, and after e
 - **red**: the game is running, or it lists what is left. **Uninstall** is enabled only when something is left and the game is closed;
 - **grey**: the game folder isn't known yet.
 
-After **Update** applies a new version, the window restarts itself. Under Wine, or with any argument, the
-console run is unchanged.
+Under Wine, or with any argument, the console run is unchanged.
 
 ## Checks it runs every time
 
@@ -106,7 +104,7 @@ While you play, the helper changes three things outside the game folder and undo
 
 | Key | Going in | Coming out |
 | --- | --- | --- |
-| `block_network` | Windows Firewall rules, inbound and outbound: `sc-offline: block StarCitizen.exe` (this install's exe only), `sc-offline: block RSI Launcher.exe` (found from its install entry, beside the game library, or the default folder) and `sc-offline: block CrashHandler.exe` (`<channel>\Tools\Public\CrashHandler.exe`, CIG's crash reporter). A rule is only added if its exe exists. `sc-offline.exe` itself stays online for updates. | deleted |
+| `block_network` | Windows Firewall rules, inbound and outbound: `sc-offline: block StarCitizen.exe` (this install's exe only), `sc-offline: block RSI Launcher.exe` (found from its install entry, beside the game library, or the default folder) and `sc-offline: block CrashHandler.exe` (`<channel>\Tools\Public\CrashHandler.exe`, CIG's crash reporter). A rule is only added if its exe exists. `sc-offline.exe` itself makes no network connections. | deleted |
 | `eac_hosts` | `127.0.0.1 modules-cdn.eac-prod.on.epicgames.com # added by sc-offline…` appended to the hosts file, then `ipconfig /flushdns`. Skipped if the hosts file already blocks it | only the tagged line removed, DNS flushed |
 | `eac_rename` | `EasyAntiCheat_EOS.exe` renamed to `EasyAntiCheat_EOS.exe.bak`. Skipped if it isn't there | renamed back |
 
@@ -115,90 +113,11 @@ While you play, the helper changes three things outside the game folder and undo
 - If a step fails, the helper undoes what it already did and the game doesn't start.
 - After a crash the record stays. `status` lists it, `uninstall` undoes it, and `play` offers to.
 
-### Updates
+### No network, no auto-update
 
-On `play` and `status` the launcher asks GitHub for the newest release of `scubamount/sc-offline`
-(3-second timeout; no network just skips it). With `update_channel = stable` (the default) only full
-releases are offered; `update_channel = prerelease` also offers pre-releases (test builds). Drafts, older
-versions and tags that aren't plain numbers are never offered. If a newer one exists, `play` asks
-**"Update now?"** and `status` tells you to run `sc-offline.exe update`. It won't update while
-`StarCitizen.exe` is running.
-
-An update:
-1. checks there's free disk space, then downloads `sc-offline-<tag>.zip`. The download only times out when
-   it stalls, and is tried once more. The zip's SHA-256 must match the `digest` GitHub publishes for that
-   asset; a mismatch or a missing digest stops it with nothing changed;
-2. unpacks it with Windows' own `tar.exe` and checks it against its `manifest.json` (see below). Any
-   problem stops it with nothing changed;
-3. stages the listed files in `data\update\staged\`. This runs with normal rights. When the install folder
-   isn't writable (Program Files), it stages in `%LOCALAPPDATA%\sc-offline\update\` instead, and only the
-   next step asks Windows for administrator rights. That step uses no network: it checks every staged
-   file against the manifest again before using it;
-4. replaces every listed file except `sc-offline.ini` and the player files in `data\` (`wallet.txt`,
-   `spawn.txt`, `bookmarks.txt`, `locations_found.txt`, `game-path.txt`, `game-build.txt`, the logs).
-   Each file is written as `<name>.update-new`, flushed to disk, the old one renamed to `<name>.update-old`,
-   and the new one moved into place and checked again. Each step is written to `data\update\applied.txt`
-   before it happens. A file that antivirus is scanning is retried for a few seconds;
-5. appends settings that are new in the release's `sc-offline.ini` to yours, commented out, so their
-   defaults apply;
-6. runs `sc-offline.exe --self-test` from the new files, then starts the new launcher with the same arguments.
-
-If a step fails, or the new launcher fails its self-test, the old files are put back at once. If the PC dies
-mid-update, the next run of `sc-offline.exe` reads `applied.txt` and puts them back. The `.update-old` files
-are deleted on the next good start. `check_updates = off` turns the check off; `sc-offline.exe update`
-checks on demand.
-
-#### What an update is checked against
-
-Two things vouch for an update. Neither is a signature: releases aren't code-signed.
-
-1. **GitHub's digest.** GitHub publishes a SHA-256 `digest` for every release asset, served over HTTPS
-   from `api.github.com`. The downloaded zip must match it.
-2. **`manifest.json` inside the zip.** CI writes it when it builds the release: the `version`, the `tag`,
-   the `commit` it was built from, and every other file in the zip with its `sha256` and `size`, one per line.
-   Its version must equal the release tag. Only files it lists are copied, and only when their SHA-256 matches.
-   A listed path with `..`, a leading `/`, a `\` or a `:` makes the whole update fail.
-
-So the update is exactly what CI built from that commit, as long as the GitHub release itself is
-trustworthy. Anyone who can publish a release on `scubamount/sc-offline` can publish an update.
-
-#### Checking a release by hand
-
-On Windows (PowerShell), in the folder you downloaded the zip to:
-
-```powershell
-# 1. The zip against GitHub's digest (shown on the release page next to the asset, or:)
-#    gh release view v0.7.0 -R scubamount/sc-offline --json assets --jq '.assets[] | [.name, .digest]'
-(Get-FileHash .\sc-offline-v0.7.0.zip -Algorithm SHA256).Hash.ToLower()
-
-# 2. Every unpacked file against manifest.json
-Expand-Archive .\sc-offline-v0.7.0.zip -DestinationPath .
-$dir = '.\sc-offline-v0.7.0'
-$man = Get-Content "$dir\manifest.json" -Raw | ConvertFrom-Json
-"$($man.tag) from commit $($man.commit), $($man.files.Count) files"
-foreach ($f in $man.files) {
-  $p = Join-Path $dir $f.path
-  if (-not (Test-Path $p)) { "MISSING  $($f.path)"; continue }
-  if ((Get-FileHash $p -Algorithm SHA256).Hash.ToLower() -ne $f.sha256) { "CHANGED  $($f.path)" }
-}
-```
-
-No output after the summary line means every listed file matches. A file in the folder that the manifest
-doesn't list (other than `manifest.json`) isn't part of the release. With Python (macOS, Linux or Windows),
-`python3 tools/release-manifest.py check sc-offline-v0.7.0` from a clone of this repository does step 2,
-also flags unlisted files, and exits non-zero on any problem. The `commit` field lets you
-look up the exact source at `https://github.com/scubamount/sc-offline/tree/<commit>`.
-
-### Discord status
-
-With the Discord app open on the same PC, **Play** sets your Discord status once the game starts:
-
-- **Playing sc-offline**: `Star Citizen offline mod`, `v<version> · single player`, and the time played
-- the sc-offline logo, and two buttons other people can click: **Join the Discord** and **Get sc-offline**
-
-The launcher talks only to the Discord app on your PC (its local pipe). It sends nothing over the network, and it needs no Discord login or token. The status clears when the game closes. If Discord isn't running, nothing happens and `launcher.log` says `Discord: not running`; if Discord starts later, the launcher picks it up within 15 seconds. Under Wine or Proton the Discord pipe usually isn't reachable, so nothing is shown.
-
-To turn it off, untick **Show on Discord** in the window or set `discord_presence = off` in `sc-offline.ini`. The change applies from the next **Play**.
+This build has no self-update and no Discord status. `sc-offline.exe` makes no network connections of its own
+(its only link out is the bug-report page, which opens in your browser when you ask for it). To update, rebuild from
+your own source. Windows Firewall blocking of the game is separate; see [PC changes](#pc-changes).
 
 ### Crash reports
 
@@ -243,9 +162,6 @@ There is no wallet setting: your aUEC balance is kept in `data\wallet.txt` (see 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `game` | (found automatically) | Your Star Citizen folder. You can point at `Roberts Space Industries`, at `StarCitizen`, at the channel folder, or at the folder that holds `StarCitizen`. |
-| `discord_presence` | `on` | While the game runs, your Discord profile shows **Playing sc-offline** with the version, time played and two buttons (the sc-offline Discord, the download page). Your Discord friends and servers see it. Also the **Show on Discord** box in the window. See [Discord status](#discord-status). |
-| `check_updates` | `on` | Check GitHub for a newer release on `play` and `status` and offer to install it. |
-| `update_channel` | `stable` | `stable`: only full releases are offered. `prerelease`: pre-releases (test builds) are offered too. |
 | `crash_reports` | `on` | After a crash, offer a redacted log bundle and the bug form. See [Crash reports](#crash-reports). |
 | `clean_logs` | `ask` | After the game closes, list this session's game logs and ask (twice) before deleting them. `off` skips it. |
 | `channel` | `LIVE` | Which install to use when `game` points above it: `LIVE`, `PTU`, `EPTU`, and so on. |

@@ -925,7 +925,7 @@ static void DrawMenuTab() {
 
     Section("About");
     Hint(SCO_TITLE " is a work in progress, " SCO_BASED_ON ".");
-    Hint("Bug reports: github.com/scubamount/sc-offline/issues");
+    Hint("Bug reports: github.com/trofdev/sc-offline/issues");
 }
 
 // =============================================================================================

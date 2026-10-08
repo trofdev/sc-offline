@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0-patch1 (2026-10-08)
+
+Patches on top of 0.7.0. This fork is built from source by each user; it publishes no releases.
+
+- **No self-update.** The launcher has no network code: no WinHTTP, no GitHub release check, no download, no staged swap, no administrator update helper. `sc-offline.exe update`, the **Update** button and the `check_updates` and `update_channel` ini keys are gone.
+- **No Discord presence.** The Discord pipe code, the **Show on Discord** checkbox and the `discord_presence` ini key are gone, and so is the workflow that posted to Discord.
+- **No releases.** The `release` job, the `v*` tag trigger, the artifact upload, `tools/release-manifest.py` and the update tests (`tools/update-test/`) are removed. CI only checks and compiles.
+- **Version** is `0.7.0-patch1` (`src/version.h`).
+- **Bug-report links** (launcher, menu, `mod.log`) point at this fork's issues.
+- Docs, `sc-offline.ini`, `SECURITY.md`, `CONTRIBUTING.md` and the README match. Firewall blocking, the hosts line and the EAC rename are unchanged.
+
 ## 0.7.0 (2026-10-07)
 
 - **Safer self-update** ([#31](https://github.com/scubamount/sc-offline/issues/31)). Each release zip now carries `manifest.json`: the version, tag, commit and every shipped file with its SHA-256. CI writes it and checks the finished zip against it. The launcher only installs files the manifest lists, with matching hashes, from a release newer than itself; paths with `..` are refused. Downloading and checking run with normal rights; for a Program Files install only the file swap asks for administrator rights, with no network. Each file is flushed to disk and checked again after it's moved; files locked by antivirus are retried. The update waits while the game runs, checks free disk space, and only times out on a stalled download. The new launcher must pass `--self-test` or the old files go back. New setting `update_channel = stable | prerelease`. `docs/launcher.md` explains how to check a download by hand.

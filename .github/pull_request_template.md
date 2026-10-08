@@ -7,7 +7,6 @@
 - [ ] `tools/check.sh` reports `0 new`
 - [ ] Built Release x64 (or relying on CI's `build`)
 - [ ] Played in game on Windows: <!-- what you tried, game version -->
-- [ ] `tools/update-test/run.sh` (only if the self-update changed)
 
 Not tested: <!-- say what you couldn't test -->
 
