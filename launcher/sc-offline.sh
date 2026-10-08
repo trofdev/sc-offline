@@ -3,7 +3,7 @@
 # Wine prefix. sc-offline.exe then finds the game, adds the mod, and removes it on exit, exactly
 # as on Windows.
 #
-#   ./sc-offline.sh [play|install|uninstall|status|update|help] [--game <Windows path>] [--dry-run]
+#   ./sc-offline.sh [play|install|uninstall|status|help] [--game <Windows path>] [--dry-run]
 #                   [--skip-eac-check] [--prefix <dir>] [--wine <path to wine>]
 #
 # --prefix and --wine are this script's; everything else goes to sc-offline.exe. With --dry-run
@@ -114,7 +114,7 @@ fi
 
 if [ ! -f "$here/sc-offline.exe" ]; then
     echo "[!] sc-offline.exe is missing next to this script ($here)."
-    echo "    Extract the whole release zip into one folder and run sc-offline.sh from there."
+    echo "    Put your build output (sc-offline.exe, dinput8.dll, sc-offline.ini, data/) in one folder with this script and run it from there."
     exit 1
 fi
 

@@ -6,7 +6,7 @@ body:
     id: version
     attributes:
       label: sc-offline version
-      description: First line of data/mod.log, or the release you downloaded
+      description: First line of data/mod.log
     validations: {required: true}
   - type: input
     id: game

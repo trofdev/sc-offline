@@ -176,7 +176,7 @@ static DWORD WINAPI ModThread(LPVOID param) {
     HMODULE self = static_cast<HMODULE>(param);
     OpenConsole();
     Log(SCO_TITLE " (" SCO_BASED_ON ")");
-    Log("Bug reports: https://github.com/scubamount/sc-offline/issues");
+    Log("Bug reports: https://github.com/trofdev/sc-offline/issues");
 
     HMODULE game = GetModuleHandleW(kTargetModule);
     if (!game) game = GetModuleHandleW(nullptr);

@@ -31,7 +31,6 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <tlhelp32.h>
-#include <winhttp.h>
 #include <winsafer.h>
 #include <commctrl.h>
 #include <cctype>
@@ -52,7 +51,6 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -123,8 +121,7 @@ static void PauseIfOwnConsole() {
 }
 
 // Exit codes: 0 ok, 1 error, 2 Easy Anti-Cheat active, 3 the game is running.
-// kExitRestart: only for the window; an update was applied and the window should restart itself.
-enum { kExitOk = 0, kExitError = 1, kExitEac = 2, kExitRunning = 3, kExitRestart = 10 };
+enum { kExitOk = 0, kExitError = 1, kExitEac = 2, kExitRunning = 3 };
 
 static int FailCode(int code, const char* fmt, ...) {
     va_list a; va_start(a, fmt);
@@ -144,14 +141,8 @@ struct Config {
     bool firewall = true, eacHosts = true, eacRename = true;
     // After the game closes: offer to delete the logs the game wrote during this session.
     bool cleanLogs = true;
-    // Check GitHub for a newer sc-offline release on play/status (issue #14).
-    bool checkUpdates = true;
-    // Which releases the update check offers: stable (full releases) or prerelease (issue #31, S5).
-    bool prereleases = false;
     // After a crash, offer a redacted log bundle and a prefilled bug form (issue #18).
     bool crashReports = true;
-    // Show "Playing sc-offline" on the player's Discord profile while the game runs (issue #34).
-    bool discordPresence = true;
 };
 
 static bool ParseOnOff(const wstring& v, bool& out) {
@@ -189,17 +180,6 @@ static bool ReadConfig(const wstring& path, Config& c) {
         }
         else if (!_wcsicmp(k.c_str(), L"crash_reports")) {
             if (!ParseOnOff(v, c.crashReports)) Out("[!] sc-offline.ini line %d: crash_reports must be on or off\n", lineNo);
-        }
-        else if (!_wcsicmp(k.c_str(), L"discord_presence")) {
-            if (!ParseOnOff(v, c.discordPresence)) Out("[!] sc-offline.ini line %d: discord_presence must be on or off\n", lineNo);
-        }
-        else if (!_wcsicmp(k.c_str(), L"check_updates")) {
-            if (!ParseOnOff(v, c.checkUpdates)) Out("[!] sc-offline.ini line %d: check_updates must be on or off\n", lineNo);
-        }
-        else if (!_wcsicmp(k.c_str(), L"update_channel")) {
-            if (!_wcsicmp(v.c_str(), L"stable")) c.prereleases = false;
-            else if (!_wcsicmp(v.c_str(), L"prerelease")) c.prereleases = true;
-            else Out("[!] sc-offline.ini line %d: update_channel must be stable or prerelease\n", lineNo);
         }
         else if (!_wcsicmp(k.c_str(), L"clean_logs")) {
             if (!_wcsicmp(v.c_str(), L"ask")) c.cleanLogs = true;
@@ -281,348 +261,6 @@ static std::string Sha256(const std::string& bytes) {
     return hex;
 }
 
-// --- Self-update (issues #14, #31) ----------------------------------------------------------
-// Ask GitHub for the newest release on the player's update_channel; if it is newer, offer to
-// download the release zip and check it against the SHA-256 digest GitHub publishes for the asset.
-// The zip's manifest.json then pins every file (path, size, SHA-256), its version must equal the
-// tag and be newer than this launcher, and only listed files are copied. Download and checks run
-// with normal rights and stage the files in data\update\staged; the part that may run as
-// administrator only re-checks the staged files and swaps them in. Each file is written as
-// .update-new, flushed, moved into place with write-through and re-hashed; the swap is journaled
-// in data\update\applied.txt before each step, so a crash rolls back on the next run, and the new
-// launcher must pass --self-test or the old files go back. Files the player owns are never
-// replaced: sc-offline.ini is kept (new keys are appended to it, commented out), and anything in
-// data\ that the release doesn't ship (wallet, saved places, bookmarks, logs) is left alone.
-
-static const wchar_t* kReleasesApi = L"https://api.github.com/repos/scubamount/sc-offline/releases/latest";
-static const wchar_t* kReleasesList = L"https://api.github.com/repos/scubamount/sc-offline/releases?per_page=20";
-
-static bool HttpGet(const wstring& url, std::string& body, DWORD timeoutMs, size_t cap) {
-    body.clear();
-    URL_COMPONENTS u{}; u.dwStructSize = sizeof(u);
-    wchar_t host[256] = {}, path[2048] = {};
-    u.lpszHostName = host; u.dwHostNameLength = ARRAYSIZE(host);
-    u.lpszUrlPath = path; u.dwUrlPathLength = ARRAYSIZE(path);
-    wchar_t extra[2048] = {}; u.lpszExtraInfo = extra; u.dwExtraInfoLength = ARRAYSIZE(extra);
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &u) || u.nScheme != INTERNET_SCHEME_HTTPS) return false;
-    const wstring agent = L"sc-offline/" + wstring(SCO_VERSION, SCO_VERSION + strlen(SCO_VERSION));
-    HINTERNET s = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s) return false;
-    // Each timeout covers one step (resolve, connect, send, one read), so a long download that keeps
-    // moving never times out; only a stall does.
-    WinHttpSetTimeouts(s, (int)timeoutMs, (int)timeoutMs, (int)timeoutMs, (int)timeoutMs);
-    bool ok = false;
-    HINTERNET c = WinHttpConnect(s, host, u.nPort, 0);
-    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", (wstring(path) + extra).c_str(), nullptr, WINHTTP_NO_REFERER,
-                                         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
-    if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-        WinHttpReceiveResponse(r, nullptr)) {
-        DWORD status = 0, len = sizeof(status);
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
-        if (status == 200) {
-            ok = true;
-            char buf[65536];
-            for (;;) {
-                DWORD got = 0;
-                if (!WinHttpReadData(r, buf, sizeof(buf), &got)) { ok = false; break; }
-                if (!got) break;
-                body.append(buf, got);
-                if (body.size() > cap) { ok = false; break; }
-            }
-        }
-    }
-    if (r) WinHttpCloseHandle(r);
-    if (c) WinHttpCloseHandle(c);
-    WinHttpCloseHandle(s);
-    return ok;
-}
-
-// The value of `key` directly inside the JSON object that starts at j[from] ('{'): a string is
-// unescaped, any other value (true, 12, null) is returned as its raw token. Nested objects and
-// arrays are skipped, so an asset's uploader can't shadow the asset's own fields.
-static bool JsonKey(const std::string& j, size_t from, const char* key, std::string& out, size_t* valueAt = nullptr) {
-    int depth = 0;
-    for (size_t i = from; i < j.size(); ++i) {
-        const char ch = j[i];
-        if (ch == '"') {
-            size_t e = i + 1; std::string str;
-            for (; e < j.size() && j[e] != '"'; ++e) {
-                if (j[e] == '\\' && e + 1 < j.size()) { ++e; str += j[e] == 'n' ? '\n' : j[e]; } else str += j[e];
-            }
-            size_t k = e + 1; while (k < j.size() && isspace((unsigned char)j[k])) ++k;
-            if (depth == 1 && k < j.size() && j[k] == ':' && str == key) {
-                ++k; while (k < j.size() && isspace((unsigned char)j[k])) ++k;
-                if (valueAt) *valueAt = k;
-                if (k < j.size() && j[k] == '"') {
-                    out.clear();
-                    for (size_t v = k + 1; v < j.size() && j[v] != '"'; ++v) {
-                        if (j[v] == '\\' && v + 1 < j.size()) ++v;
-                        out += j[v];
-                    }
-                } else {
-                    size_t v = k; while (v < j.size() && j[v] != ',' && j[v] != '}' && !isspace((unsigned char)j[v])) ++v;
-                    out = j.substr(k, v - k);
-                }
-                return true;
-            }
-            i = e;
-        } else if (ch == '{' || ch == '[') ++depth;
-        else if (ch == '}' || ch == ']') { if (--depth <= 0) return false; }
-    }
-    return false;
-}
-
-// "v0.4.2" / "0.4.2" -> {0,4,2,0}. False on anything that isn't 1-4 dot-separated numbers;
-// ParseTagVersion handles a "-rc1" suffix.
-static bool ParseVersion(std::string v, int out[4]) {
-    if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) v.erase(0, 1);
-    int n = 0; out[0] = out[1] = out[2] = out[3] = 0;
-    size_t i = 0;
-    while (i < v.size()) {
-        if (n == 4 || !isdigit((unsigned char)v[i])) return false;
-        long x = 0;
-        while (i < v.size() && isdigit((unsigned char)v[i])) { x = x * 10 + (v[i] - '0'); if (x > 100000) return false; ++i; }
-        out[n++] = (int)x;
-        if (i < v.size()) { if (v[i] != '.' || i + 1 == v.size()) return false; ++i; }
-    }
-    return n > 0;
-}
-
-struct UpdateInfo { std::string tag, zipName, zipUrl, sha256; unsigned long long size = 0; };
-
-// Skips the JSON object or array starting at j[i]; returns the index just past it.
-static size_t SkipJsonValue(const std::string& j, size_t i) {
-    int depth = 0; bool str = false;
-    for (; i < j.size(); ++i) {
-        const char c = j[i];
-        if (str) { if (c == '\\') ++i; else if (c == '"') str = false; continue; }
-        if (c == '"') str = true;
-        else if (c == '{' || c == '[') ++depth;
-        else if (c == '}' || c == ']') { if (--depth == 0) return i + 1; }
-    }
-    return j.size();
-}
-
-// The release object at body[top]: its tag and the sc-offline-<tag>.zip asset with a SHA-256 digest.
-static bool ReleaseAsset(const std::string& body, size_t top, UpdateInfo& u, std::string& why) {
-    std::string tag, raw; size_t at = 0;
-    if (!JsonKey(body, top, "tag_name", tag)) { why = "unexpected reply from GitHub"; return false; }
-    const std::string want = "sc-offline-" + tag + ".zip";
-    if (!JsonKey(body, top, "assets", raw, &at) || at >= body.size() || body[at] != '[') { why = tag + " has no assets"; return false; }
-    for (size_t i = at + 1; i < body.size();) {
-        while (i < body.size() && (isspace((unsigned char)body[i]) || body[i] == ',')) ++i;
-        if (i >= body.size() || body[i] != '{') break;
-        std::string name, url, digest;
-        JsonKey(body, i, "name", name);
-        if (name == want && JsonKey(body, i, "browser_download_url", url) && JsonKey(body, i, "digest", digest) &&
-            !digest.compare(0, 7, "sha256:") && digest.size() == 7 + 64) {
-            u.tag = tag; u.zipName = name; u.zipUrl = url; u.sha256 = digest.substr(7);
-            std::string size;
-            if (JsonKey(body, i, "size", size) && !size.empty() && size.size() < 16 && size.find_first_not_of("0123456789") == std::string::npos)
-                u.size = std::stoull(size);
-            for (char& c : u.sha256) c = (char)tolower((unsigned char)c);
-            return true;
-        }
-        i = SkipJsonValue(body, i);
-    }
-    why = tag + " has no " + want + " with a SHA-256 digest";
-    return false;
-}
-
-static bool VersionGreater(const std::string& a, const std::string& b);
-
-// S5: what GitHub offers on the player's channel. stable = the latest full release; prerelease =
-// the newest release of any kind (drafts never). Empty tag when there's nothing newer to offer.
-static UpdateInfo CheckLatest(DWORD timeoutMs, bool prerelease, std::string* why) {
-    UpdateInfo u;
-    std::string body, w;
-    const wstring url = prerelease ? wstring(kReleasesList) : wstring(kReleasesApi);
-    if (!HttpGet(url, body, timeoutMs, 4u << 20)) { if (why) *why = "couldn't reach GitHub"; return u; }
-    // One release object (stable) or an array of them (prerelease); take the newest acceptable one.
-    std::vector<size_t> tops;
-    size_t first = body.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) { if (why) *why = "unexpected reply from GitHub"; return u; }
-    if (body[first] == '{') tops.push_back(first);
-    else if (body[first] == '[')
-        for (size_t i = first + 1; i < body.size();) {
-            while (i < body.size() && (isspace((unsigned char)body[i]) || body[i] == ',')) ++i;
-            if (i >= body.size() || body[i] != '{') break;
-            tops.push_back(i);
-            i = SkipJsonValue(body, i);
-        }
-    std::string best, newestSeen;
-    for (size_t top : tops) {
-        std::string tag, pre, draft;
-        if (!JsonKey(body, top, "tag_name", tag)) continue;
-        JsonKey(body, top, "prerelease", pre); JsonKey(body, top, "draft", draft);
-        if (draft == "true" || (!prerelease && pre == "true")) { if (tops.size() == 1) w = "latest release is a pre-release"; continue; }
-        if (newestSeen.empty() || VersionGreater(tag, newestSeen)) newestSeen = tag;
-        if (!VersionGreater(tag, SCO_VERSION)) continue;
-        if (!best.empty() && !VersionGreater(tag, best)) continue;
-        UpdateInfo cand; std::string candWhy;
-        if (ReleaseAsset(body, top, cand, candWhy)) { u = cand; best = tag; }
-        else w = candWhy;
-    }
-    if (u.tag.empty() && why) *why = !w.empty() ? w : newestSeen.empty() ? std::string("no releases found") : "up to date (latest " + newestSeen + ")";
-    return u;
-}
-
-// --- Release manifest (issue #31, S1-S3) ---------------------------------------------------
-// CI writes manifest.json into the release folder (tools/release-manifest.py): format 1, version,
-// tag, commit and one {"path","sha256","size"} object per shipped file. The zip itself is still
-// checked against GitHub's digest; the manifest then pins every file inside it. Only listed files
-// are ever copied, each one re-hashed first.
-
-struct ManifestFile { std::string path; std::string sha256; unsigned long long size = 0; };
-struct Manifest { std::string version, tag, commit; std::vector<ManifestFile> files; };
-
-// "v0.7.0-rc1" -> numbers {0,7,0,0} + pre "rc1". False unless 1-4 dot-separated numbers, then
-// optionally "-" and [0-9A-Za-z.]+.
-static bool ParseTagVersion(std::string v, int num[4], std::string& pre) {
-    pre.clear();
-    const size_t dash = v.find('-');
-    if (dash != std::string::npos) {
-        pre = v.substr(dash + 1);
-        v.resize(dash);
-        if (pre.empty()) return false;
-        for (char c : pre) if (!isalnum((unsigned char)c) && c != '.') return false;
-    }
-    return ParseVersion(v, num);
-}
-
-// a > b. A pre-release sorts below the same numbers without one (0.7.0-rc1 < 0.7.0).
-static bool VersionGreater(const std::string& a, const std::string& b) {
-    int x[4], y[4]; std::string px, py;
-    if (!ParseTagVersion(a, x, px) || !ParseTagVersion(b, y, py)) return false;
-    for (int i = 0; i < 4; ++i) if (x[i] != y[i]) return x[i] > y[i];
-    if (px.empty() != py.empty()) return px.empty();
-    return px > py;
-}
-
-// S3: a manifest path is relative, '/'-separated, with no '..', '.', empty part, ':' (alternate
-// data streams, drive letters), '\\' or control character. Returns the Windows relative path, or
-// empty when refused.
-static wstring SafeRelPath(const std::string& p) {
-    if (p.empty() || p.size() > 400 || p[0] == '/' || p.find('\\') != std::string::npos || p.find(':') != std::string::npos)
-        return L"";
-    for (unsigned char c : p) if (c < 0x20 || c == '"' || c == '*' || c == '?' || c == '<' || c == '>' || c == '|') return L"";
-    size_t from = 0;
-    while (true) {
-        const size_t slash = p.find('/', from);
-        const std::string part = p.substr(from, slash == std::string::npos ? std::string::npos : slash - from);
-        if (part.empty() || part == "." || part == ".." || part.back() == '.' || part.back() == ' ') return L"";
-        if (slash == std::string::npos) break;
-        from = slash + 1;
-    }
-    wstring w = Wide(p);
-    for (wchar_t& c : w) if (c == L'/') c = L'\\';
-    return w;
-}
-
-static bool IsHex64(const std::string& s) {
-    if (s.size() != 64) return false;
-    for (char c : s) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-    return true;
-}
-
-// Parses manifest.json. Unknown keys are ignored. False with a reason when anything required is
-// missing or malformed.
-static bool ParseManifest(const std::string& j, Manifest& m, std::string& why) {
-    m = Manifest{};
-    const size_t top = j.find('{');
-    std::string format;
-    if (top == std::string::npos || !JsonKey(j, top, "format", format) || format != "1") { why = "manifest format isn't 1"; return false; }
-    if (!JsonKey(j, top, "version", m.version) || !JsonKey(j, top, "tag", m.tag)) { why = "manifest has no version or tag"; return false; }
-    JsonKey(j, top, "commit", m.commit);
-    std::string raw; size_t at = 0;
-    if (!JsonKey(j, top, "files", raw, &at) || at >= j.size() || j[at] != '[') { why = "manifest has no files list"; return false; }
-    for (size_t i = at + 1; i < j.size();) {
-        while (i < j.size() && (isspace((unsigned char)j[i]) || j[i] == ',')) ++i;
-        if (i >= j.size() || j[i] == ']') break;
-        if (j[i] != '{') { why = "manifest files list is malformed"; return false; }
-        ManifestFile f; std::string size;
-        if (!JsonKey(j, i, "path", f.path) || !JsonKey(j, i, "sha256", f.sha256) || !JsonKey(j, i, "size", size)) {
-            why = "a manifest entry lacks path, sha256 or size"; return false;
-        }
-        for (char& c : f.sha256) c = (char)tolower((unsigned char)c);
-        if (!IsHex64(f.sha256)) { why = "bad sha256 for " + f.path; return false; }
-        if (size.empty() || size.size() > 15 || size.find_first_not_of("0123456789") != std::string::npos) { why = "bad size for " + f.path; return false; }
-        f.size = std::stoull(size);
-        if (SafeRelPath(f.path).empty()) { why = "refused path in manifest: " + f.path; return false; }
-        for (const ManifestFile& o : m.files) if (!_stricmp(o.path.c_str(), f.path.c_str())) { why = "path listed twice: " + f.path; return false; }
-        m.files.push_back(f);
-        i = SkipJsonValue(j, i);
-    }
-    if (m.files.empty()) { why = "manifest lists no files"; return false; }
-    return true;
-}
-
-// S2: the manifest must belong to the release that was asked for, and be newer than this launcher.
-static bool ManifestMatchesRelease(const Manifest& m, const std::string& tag, std::string& why) {
-    if (m.tag != tag) { why = "manifest tag " + m.tag + " isn't the release tag " + tag; return false; }
-    if ("v" + m.version != tag) { why = "manifest version " + m.version + " doesn't match tag " + tag; return false; }
-    if (!VersionGreater(m.version, SCO_VERSION)) { why = "manifest version " + m.version + " isn't newer than " + SCO_VERSION; return false; }
-    return true;
-}
-
-// SHA-256 of a file, streamed (lowercase hex, empty when unreadable).
-static std::string FileSha256(const wstring& path, unsigned long long* size = nullptr) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return "";
-    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE h = nullptr;
-    std::string hex; unsigned long long total = 0;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0) {
-        if (BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0) {
-            std::vector<unsigned char> buf(1 << 20);
-            DWORD got = 0; bool ok = true;
-            while ((ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr) != 0) && got) {
-                if (BCryptHashData(h, buf.data(), got, 0) != 0) { ok = false; break; }
-                total += got;
-            }
-            unsigned char digest[32];
-            if (ok && BCryptFinishHash(h, digest, sizeof(digest), 0) == 0) {
-                char two[3];
-                for (unsigned char c : digest) { std::snprintf(two, sizeof(two), "%02x", c); hex += two; }
-            }
-            BCryptDestroyHash(h);
-        }
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-    CloseHandle(f);
-    if (size) *size = total;
-    return hex;
-}
-
-// Every manifest file exists under root with the listed size and sha256. Files under root that
-// the manifest doesn't list are ignored here and never copied.
-static bool VerifyAgainstManifest(const wstring& root, const Manifest& m, std::string& why) {
-    for (const ManifestFile& f : m.files) {
-        const wstring p = root + L"\\" + SafeRelPath(f.path);
-        const DWORD a = GetFileAttributesW(p.c_str());
-        if (a == INVALID_FILE_ATTRIBUTES || (a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) { why = f.path + " is missing"; return false; }
-        unsigned long long size = 0;
-        const std::string got = FileSha256(p, &size);
-        if (got != f.sha256 || size != f.size) { why = f.path + " doesn't match the manifest"; return false; }
-    }
-    return true;
-}
-
-static std::vector<wstring> FilesUnder(const wstring& root, const wstring& rel = L"") {
-    std::vector<wstring> out;
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((root + (rel.empty() ? L"" : L"\\" + rel) + L"\\*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return out;
-    do {
-        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-        const wstring r = rel.empty() ? wstring(fd.cFileName) : rel + L"\\" + fd.cFileName;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { auto sub = FilesUnder(root, r); out.insert(out.end(), sub.begin(), sub.end()); }
-        else out.push_back(r);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    return out;
-}
-
 static void RemoveTree(const wstring& dir) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
@@ -646,578 +284,6 @@ static bool RunWait(const wstring& exe, wstring cmd, const wstring& cwd, DWORD& 
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return true;
-}
-
-// Paths (relative to the launcher folder) an update must never replace.
-static bool PlayerOwned(const wstring& rel) {
-    static const wchar_t* kKeep[] = { L"sc-offline.ini", L"data\\wallet.txt", L"data\\spawn.txt", L"data\\bookmarks.txt",
-        L"data\\locations_found.txt", L"data\\game-path.txt", L"data\\game-build.txt", L"data\\mod.log",
-        L"data\\launcher.log", L"data\\registry-dump.txt" };
-    for (const wchar_t* k : kKeep) if (!_wcsicmp(rel.c_str(), k)) return true;
-    return !_wcsnicmp(rel.c_str(), L"data\\update\\", 12);
-}
-
-static bool CanWriteTo(const wstring& dir);
-
-static wstring UpdateDir(const wstring& here) { return here + L"\\data\\update"; }
-static wstring Journal(const wstring& here) { return UpdateDir(here) + L"\\applied.txt"; }
-
-static bool JournalLine(const wstring& here, const std::string& line) {
-    HANDLE f = CreateFileW(Journal(here).c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_FLAG_WRITE_THROUGH, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    const std::string l = line + "\n";
-    DWORD put = 0;
-    const bool ok = WriteFile(f, l.data(), (DWORD)l.size(), &put, nullptr) && put == l.size();
-    FlushFileBuffers(f);
-    CloseHandle(f);
-    return ok;
-}
-
-// D2: antivirus (Defender scanning a new exe or DLL) and indexers hold files open for a moment.
-// Retry sharing / access-denied / lock errors with growing waits instead of giving up at once.
-static bool TransientLock(DWORD e) { return e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED || e == ERROR_LOCK_VIOLATION; }
-static const DWORD kLockWaits[] = { 100, 250, 500, 1000, 2000, 4000 };
-
-static bool MoveRetrying(const wstring& from, const wstring& to, DWORD flags) {
-    for (int i = 0;; ++i) {
-        if (MoveFileExW(from.c_str(), to.c_str(), flags)) return true;
-        const DWORD e = GetLastError();
-        if (!TransientLock(e) || i == ARRAYSIZE(kLockWaits)) { SetLastError(e); return false; }
-        Out("[i] %ls is in use (error %lu, antivirus?); trying again in %lu ms\n", from.c_str(), e, kLockWaits[i]);
-        Sleep(kLockWaits[i]);
-    }
-}
-
-// D1: copies src to dst and flushes dst to disk before returning.
-static bool CopyFlushed(const wstring& src, const wstring& dst) {
-    std::string bytes;
-    if (!ReadAll(src, bytes)) return false;
-    HANDLE f = INVALID_HANDLE_VALUE;
-    for (int i = 0;; ++i) {
-        f = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (f != INVALID_HANDLE_VALUE) break;
-        const DWORD e = GetLastError();
-        if (!TransientLock(e) || i == ARRAYSIZE(kLockWaits)) { SetLastError(e); return false; }
-        Sleep(kLockWaits[i]);
-    }
-    DWORD put = 0;
-    bool ok = WriteFile(f, bytes.data(), (DWORD)bytes.size(), &put, nullptr) && put == bytes.size();
-    ok = FlushFileBuffers(f) && ok;
-    const DWORD e = GetLastError();
-    CloseHandle(f);
-    SetLastError(e);
-    return ok;
-}
-
-// Undo an unfinished swap from its journal: "R <rel>" = the old file was moved to <rel>.update-old,
-// "N <rel>" = a new file was created where none was. Processed newest first.
-static void RollBackUpdate(const wstring& here) {
-    std::string j;
-    if (!ReadAll(Journal(here), j)) return;
-    std::vector<std::string> lines;
-    for (size_t p = 0; p < j.size();) { size_t n = j.find('\n', p); if (n == std::string::npos) n = j.size(); lines.push_back(j.substr(p, n - p)); p = n + 1; }
-    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
-        if (it->size() < 3) continue;
-        const wstring path = here + L"\\" + Wide(it->substr(2));
-        DeleteFileW((path + L".update-new").c_str());
-        if ((*it)[0] == 'N') DeleteFileW(path.c_str());
-        else if ((*it)[0] == 'R' && IsFile(path + L".update-old")) {
-            // A running new sc-offline.exe can't be deleted, but it can be renamed out of the way.
-            if (IsFile(path) && !DeleteFileW(path.c_str())) MoveRetrying(path, path + L".update-failed", MOVEFILE_REPLACE_EXISTING);
-            MoveRetrying(path + L".update-old", path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-        }
-    }
-}
-
-// Run at every start: finish (clean up) or roll back whatever a previous update left.
-static void SettlePreviousUpdate(const wstring& here) {
-    std::string j;
-    if (!ReadAll(Journal(here), j)) return;
-    const bool done = j.size() >= 5 && j.compare(j.size() - 5, 5, "done\n") == 0;
-    if (!done) {
-        Out("[!] a previous update didn't finish; putting the old files back\n");
-        RollBackUpdate(here);
-    }
-    bool leftover = false;
-    for (size_t p = 0; p < j.size();) {
-        size_t n = j.find('\n', p); if (n == std::string::npos) n = j.size();
-        const std::string line = j.substr(p, n - p); p = n + 1;
-        if (line.size() > 2 && line[0] == 'R') {
-            const wstring old = here + L"\\" + Wide(line.substr(2)) + L".update-old";
-            if (IsFile(old) && !DeleteFileW(old.c_str())) leftover = true;   // the old exe can still be locked for a moment
-        }
-    }
-    if (!leftover) RemoveTree(UpdateDir(here));
-}
-
-// Keys the new sc-offline.ini has that the player's doesn't: appended commented out, with defaults.
-static void MergeIni(const wstring& here, const wstring& newIni, const std::string& tag) {
-    std::string mine, theirs;
-    if (!ReadAll(here + L"\\sc-offline.ini", mine) || !ReadAll(newIni, theirs)) return;
-    auto keys = [](const std::string& t) {
-        std::vector<std::pair<std::string, std::string>> out;
-        for (size_t p = 0; p < t.size();) {
-            size_t n = t.find('\n', p); if (n == std::string::npos) n = t.size();
-            std::string l = t.substr(p, n - p); p = n + 1;
-            while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
-            size_t b = l.find_first_not_of(" \t#"); if (b == std::string::npos) continue;
-            const size_t eq = l.find('=', b); if (eq == std::string::npos) continue;
-            std::string k = l.substr(b, eq - b); while (!k.empty() && isspace((unsigned char)k.back())) k.pop_back();
-            if (k.empty() || k.find(' ') != std::string::npos) continue;
-            out.push_back({ k, l.substr(b) });
-        }
-        return out;
-    };
-    const auto mineKeys = keys(mine);
-    std::string add;
-    for (const auto& kv : keys(theirs)) {
-        bool have = false;
-        for (const auto& m : mineKeys) if (!_stricmp(m.first.c_str(), kv.first.c_str())) { have = true; break; }
-        if (!have) { add += "# " + kv.second + "\r\n"; Out("[i] sc-offline.ini: new setting %s (added commented out; the default applies)\n", kv.first.c_str()); }
-    }
-    if (add.empty()) return;
-    if (!mine.empty() && mine.back() != '\n') mine += "\r\n";
-    WriteAll(here + L"\\sc-offline.ini", mine + "\r\n# New in " + tag + ":\r\n" + add);
-}
-
-// S4: the update runs in two parts. StageUpdate (normal rights) downloads, checks the zip against
-// GitHub's digest, unpacks it, checks the manifest and copies the listed files into a staging
-// folder. SwapStaged (the only part that may run as administrator) reads nothing from the network:
-// it re-checks the staged files against the staged manifest and swaps them in.
-
-// Where an update is staged: data\update when this folder is writable, else (a Program Files
-// install) %LOCALAPPDATA%\sc-offline\update, which the elevated part re-checks file by file.
-static wstring StageRoot(const wstring& here) {
-    if (CanWriteTo(here + L"\\data")) return UpdateDir(here);
-    wchar_t buf[MAX_PATH];
-    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, ARRAYSIZE(buf));
-    if (!n || n >= ARRAYSIZE(buf)) return UpdateDir(here);
-    const wstring root = wstring(buf, n) + L"\\sc-offline";
-    CreateDirectoryW(root.c_str(), nullptr);
-    return root + L"\\update";
-}
-
-// Reads and checks a staged manifest: parses, belongs to `tag`, newer than this launcher (S2).
-static bool LoadManifest(const wstring& dir, const std::string& tag, Manifest& man, std::string& why) {
-    std::string text;
-    if (!ReadAll(dir + L"\\manifest.json", text)) { why = "no manifest.json"; return false; }
-    return ParseManifest(text, man, why) && ManifestMatchesRelease(man, tag, why);
-}
-
-// Unpacks a downloaded, digest-checked zip and stages exactly the files its manifest lists.
-// Refuses a zip holding files the manifest doesn't list (S3).
-static bool StageZip(const wstring& root, const wstring& zipPath, const std::string& tag) {
-    const wstring ex = root + L"\\new", staged = root + L"\\staged";
-    RemoveTree(ex); RemoveTree(staged);
-    CreateDirectoryW(ex.c_str(), nullptr);
-    wchar_t sys[MAX_PATH]; GetSystemDirectoryW(sys, MAX_PATH);
-    const wstring tar = wstring(sys) + L"\\tar.exe";
-    DWORD code = 1;
-    if (!IsFile(tar) || !RunWait(tar, L"\"" + tar + L"\" -xf \"" + zipPath + L"\" -C \"" + ex + L"\"", ex, code) || code) {
-        Out("[!] couldn't unpack the zip (Windows' tar.exe %s); nothing changed.\n"
-            "    Update by hand: %s\n", IsFile(tar) ? "failed" : "is missing", "https://github.com/scubamount/sc-offline/releases/latest");
-        return false;
-    }
-    const wstring pkg = ex + L"\\sc-offline-" + Wide(tag);
-    Manifest man; std::string why;
-    if (!LoadManifest(pkg, tag, man, why) || !VerifyAgainstManifest(pkg, man, why)) {
-        Out("[!] the release's manifest check failed (%s); nothing changed\n", why.c_str());
-        return false;
-    }
-    for (const wstring& rel : FilesUnder(ex)) {
-        const wstring prefix = L"sc-offline-" + Wide(tag) + L"\\";
-        const bool inPkg = !_wcsnicmp(rel.c_str(), prefix.c_str(), prefix.size());
-        const wstring sub = inPkg ? rel.substr(prefix.size()) : rel;
-        bool listed = inPkg && !_wcsicmp(sub.c_str(), L"manifest.json");
-        for (const ManifestFile& f : man.files) if (inPkg && !_wcsicmp(SafeRelPath(f.path).c_str(), sub.c_str())) { listed = true; break; }
-        if (!listed) { Out("[!] the zip holds %ls, which its manifest doesn't list; nothing changed\n", rel.c_str()); return false; }
-    }
-    if (!IsFile(pkg + L"\\sc-offline.exe") || !IsFile(pkg + L"\\dinput8.dll")) {
-        Out("[!] the release doesn't hold sc-offline.exe and dinput8.dll; nothing changed\n");
-        return false;
-    }
-    CreateDirectoryW(staged.c_str(), nullptr);
-    for (const ManifestFile& f : man.files) {
-        const wstring rel = SafeRelPath(f.path);
-        const size_t cut = rel.find_last_of(L'\\');
-        if (cut != wstring::npos) SHCreateDirectoryExW(nullptr, (staged + L"\\" + rel.substr(0, cut)).c_str(), nullptr);
-        if (!CopyFileW((pkg + L"\\" + rel).c_str(), (staged + L"\\" + rel).c_str(), FALSE)) {
-            Out("[!] couldn't stage %ls (error %lu); nothing changed\n", rel.c_str(), GetLastError()); return false;
-        }
-    }
-    if (!CopyFileW((pkg + L"\\manifest.json").c_str(), (staged + L"\\manifest.json").c_str(), FALSE) ||
-        !VerifyAgainstManifest(staged, man, why)) {
-        Out("[!] staging failed (%s); nothing changed\n", why.empty() ? "manifest.json" : why.c_str()); return false;
-    }
-    RemoveTree(ex);
-    Out("[+] all %zu files match the release manifest (%s); staged\n", man.files.size(), man.tag.c_str());
-    return true;
-}
-
-// Downloads the release zip, checks it against GitHub's digest and stages it. Network: normal rights only.
-static bool StageUpdate(const wstring& here, const UpdateInfo& u) {
-    const wstring root = StageRoot(here);
-    RemoveTree(root + L"\\staged"); RemoveTree(root + L"\\new");
-    CreateDirectoryW(root.c_str(), nullptr);
-    // D3: room for the zip, the unpacked copy and the staged copy, plus the files being replaced.
-    ULARGE_INTEGER freeBytes{};
-    const unsigned long long need = (u.size ? u.size : (64ull << 20)) * 6 + (32ull << 20);
-    if (GetDiskFreeSpaceExW(root.c_str(), &freeBytes, nullptr, nullptr) && freeBytes.QuadPart < need) {
-        Out("[!] not enough free disk space for the update (%llu MB free, %llu MB needed); nothing changed\n",
-            freeBytes.QuadPart >> 20, need >> 20);
-        return false;
-    }
-    Out("[i] downloading %s ...\n", u.zipName.c_str());
-    std::string zip;
-    // D3: the timeout is per read (a stalled download), not for the whole file; one retry.
-    bool got = HttpGet(Wide(u.zipUrl), zip, 30000, 256u << 20);
-    if (!got) { Out("[i] the download stalled or failed; trying once more\n"); got = HttpGet(Wide(u.zipUrl), zip, 30000, 256u << 20); }
-    if (!got) { Out("[!] download failed; nothing changed\n"); return false; }
-    const std::string digest = Sha256(zip);
-    if (digest != u.sha256) {
-        Out("[!] the download doesn't match GitHub's SHA-256 (got %s, expected %s); nothing changed\n", digest.c_str(), u.sha256.c_str());
-        return false;
-    }
-    Out("[+] SHA-256 matches GitHub's digest\n");
-    const wstring zipPath = root + L"\\" + Wide(u.zipName);
-    if (!WriteAll(zipPath, zip)) { Out("[!] couldn't save the download; nothing changed\n"); return false; }
-    const bool ok = StageZip(root, zipPath, u.tag);
-    DeleteFileW(zipPath.c_str());
-    if (!ok) { RemoveTree(root + L"\\staged"); RemoveTree(root + L"\\new"); }
-    return ok;
-}
-
-// Swaps the staged files in. Re-checks the staged manifest (tag, version) and every file first.
-static bool GameRunning();
-static bool SelfTestPasses(const wstring& here, const std::string& tag);
-
-static bool SwapStaged(const wstring& here, const wstring& staged, const std::string& tag) {
-    // D4: never swap files under a running game (it may hold dinput8.dll, and the player would get
-    // a half-updated mod on the next start).
-    if (GameRunning()) { Out("[!] %ls is running; close it before updating. Nothing changed\n", kGameExe); return false; }
-    Manifest man; std::string why;
-    if (!LoadManifest(staged, tag, man, why) || !VerifyAgainstManifest(staged, man, why)) {
-        Out("[!] the staged update doesn't match its manifest (%s); nothing changed\n", why.c_str());
-        return false;
-    }
-    CreateDirectoryW((here + L"\\data").c_str(), nullptr);
-    CreateDirectoryW(UpdateDir(here).c_str(), nullptr);
-    DeleteFileW(Journal(here).c_str());
-    // Swap, journaling each step before it happens. Only files the manifest lists are copied.
-    int replaced = 0, added = 0, done = 0;
-    bool ok = true;
-#ifdef SCO_UPDATE_TEST
-    // Test hook (D6): SCO_TEST_FAIL_AFTER=N fails the swap after N files, as a crash or a full disk would.
-    wchar_t failEnv[16] = {};
-    const int failAfter = GetEnvironmentVariableW(L"SCO_TEST_FAIL_AFTER", failEnv, ARRAYSIZE(failEnv)) ? _wtoi(failEnv) : -1;
-#endif
-    for (const ManifestFile& mf : man.files) {
-        const wstring rel = SafeRelPath(mf.path);
-        if (PlayerOwned(rel)) continue;
-#ifdef SCO_UPDATE_TEST
-        if (failAfter >= 0 && done >= failAfter) { Out("[!] SCO_TEST_FAIL_AFTER=%d: failing the swap here\n", failAfter); ok = false; break; }
-#endif
-        const wstring dst = here + L"\\" + rel, src = staged + L"\\" + rel, fresh = dst + L".update-new";
-        const size_t cut = rel.find_last_of(L'\\');
-        if (cut != wstring::npos) SHCreateDirectoryExW(nullptr, (here + L"\\" + rel.substr(0, cut)).c_str(), nullptr);
-        // D1: write the new file beside its target, flushed to disk, and check it before anything moves.
-        if (!CopyFlushed(src, fresh) || FileSha256(fresh) != mf.sha256) {
-            Out("[!] couldn't write %ls (error %lu)\n", rel.c_str(), GetLastError()); DeleteFileW(fresh.c_str()); ok = false; break;
-        }
-        const bool had = IsFile(dst);
-        if (!JournalLine(here, std::string(had ? "R " : "N ") + Narrow(rel))) { DeleteFileW(fresh.c_str()); ok = false; break; }
-        if (had && !MoveRetrying(dst, dst + L".update-old", MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            Out("[!] couldn't move %ls aside (error %lu)\n", rel.c_str(), GetLastError()); DeleteFileW(fresh.c_str()); ok = false; break;
-        }
-        if (!MoveRetrying(fresh, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) || FileSha256(dst) != mf.sha256) {
-            Out("[!] couldn't put %ls in place (error %lu)\n", rel.c_str(), GetLastError()); DeleteFileW(fresh.c_str()); ok = false; break;
-        }
-        ++(had ? replaced : added); ++done;
-    }
-    if (!ok) {
-        Out("[!] update failed; putting the old files back\n");
-        RollBackUpdate(here);
-        DeleteFileW(Journal(here).c_str());
-        return false;
-    }
-    // D5: the new launcher must start. If its --self-test fails, the old files go back; the
-    // .update-old copies stay until the next good start (SettlePreviousUpdate) either way.
-    if (!SelfTestPasses(here, tag)) {
-        Out("[!] the new sc-offline.exe failed its self-test; putting the old files back\n");
-        RollBackUpdate(here);
-        DeleteFileW(Journal(here).c_str());
-        return false;
-    }
-    if (IsFile(staged + L"\\sc-offline.ini")) MergeIni(here, staged + L"\\sc-offline.ini", tag);
-    JournalLine(here, "done");
-    Out("[+] updated to %s: %d files replaced, %d added; your saves and sc-offline.ini were kept\n", tag.c_str(), replaced, added);
-    return true;
-}
-
-// The swap, as administrator when this folder needs it (issue #16): `sc-offline.exe
-// --elevated-update <tag> <staged folder>` only re-checks and swaps; it never touches the network,
-// starts the game or relaunches, so the new launcher (and the game) still start with normal rights.
-static bool SwapMaybeElevated(const wstring& here, const wstring& staged, const std::string& tag) {
-    if (CanWriteTo(here) && CanWriteTo(here + L"\\data")) return SwapStaged(here, staged, tag);
-    Out("[i] this folder needs administrator rights to update; Windows will ask once.\n"
-        "    (Only the file swap runs as administrator; the game never does.)\n");
-    wchar_t self[MAX_PATH * 2]; GetModuleFileNameW(nullptr, self, ARRAYSIZE(self));
-    const wstring args = L"--elevated-update " + Wide(tag) + L" \"" + staged + L"\"";
-    SHELLEXECUTEINFOW sei{}; sei.cbSize = sizeof(sei); sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpVerb = L"runas"; sei.lpFile = self; sei.lpParameters = args.c_str(); sei.lpDirectory = here.c_str(); sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei) || !sei.hProcess) { Out("[!] administrator rights refused; nothing changed\n"); return false; }
-    WaitForSingleObject(sei.hProcess, INFINITE);
-    DWORD code = 1; GetExitCodeProcess(sei.hProcess, &code); CloseHandle(sei.hProcess);
-    if (code) { Out("[!] the update failed (exit %lu); see data\\launcher.log. Your current version is unchanged.\n", code); return false; }
-    return true;
-}
-
-// The elevated half: only accepts a staging folder named ...\update\staged.
-static int ElevatedUpdate(const wstring& here, const wstring& tag, const wstring& staged) {
-    OpenLog(here + L"\\data", true, "elevated update");
-    const wstring tail = L"\\update\\staged";
-    if (staged.size() <= tail.size() || _wcsicmp(staged.c_str() + staged.size() - tail.size(), tail.c_str())) {
-        Out("[!] refusing staging folder %ls\n", staged.c_str()); return kExitError;
-    }
-    return SwapStaged(here, StripSlashes(staged), Narrow(tag)) ? kExitOk : kExitError;
-}
-
-// Swaps a staged update in (as administrator only when needed); the staging folder goes either way.
-static bool InstallStaged(const wstring& here, const std::string& tag) {
-    const wstring staged = StageRoot(here) + L"\\staged";
-    const bool ok = SwapMaybeElevated(here, staged, tag);
-    RemoveTree(staged);
-    return ok;
-}
-
-static bool ApplyUpdate(const wstring& here, const UpdateInfo& u) {
-    return StageUpdate(here, u) && InstallStaged(here, u.tag);
-}
-
-// D5: runs `<here>\sc-offline.exe --self-test <tag>` and waits up to 30 s. When this process is
-// elevated, the new exe still runs with normal rights (a Safer "normal user" token).
-static bool SelfTestPasses(const wstring& here, const std::string& tag) {
-    const wstring exe = here + L"\\sc-offline.exe";
-    wstring cmd = L"\"" + exe + L"\" --self-test " + Wide(tag);
-    STARTUPINFOW si{}; si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    bool started = false;
-    SAFER_LEVEL_HANDLE level = nullptr; HANDLE token = nullptr;
-    if (SaferCreateLevel(SAFER_SCOPEID_USER, SAFER_LEVELID_NORMALUSER, SAFER_LEVEL_OPEN, &level, nullptr)) {
-        if (SaferComputeTokenFromLevel(level, nullptr, &token, 0, nullptr))
-            started = CreateProcessAsUserW(token, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, here.c_str(), &si, &pi) != 0;
-        if (token) CloseHandle(token);
-        SaferCloseLevel(level);
-    }
-    if (!started) started = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, here.c_str(), &si, &pi) != 0;
-    if (!started) { Out("[!] couldn't start the new sc-offline.exe (error %lu)\n", GetLastError()); return false; }
-    DWORD code = 1;
-    if (WaitForSingleObject(pi.hProcess, 30000) != WAIT_OBJECT_0) { TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000); Out("[!] the new sc-offline.exe hung in its self-test\n"); }
-    else GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    if (code) { Out("[!] the new sc-offline.exe --self-test exited %lu\n", code); return false; }
-    Out("[+] the new sc-offline.exe passed its self-test\n");
-    return true;
-}
-
-// --self-test <tag>: what an update runs on the new launcher before keeping it. Checks this exe is
-// the version the manifest promised, that SHA-256 works and that dinput8.dll is beside it. Writes
-// nothing, reads no network.
-static int SelfTest(const std::string& tag) {
-    const wstring here = ExeDir();
-    if (tag != std::string("v") + SCO_VERSION) { std::printf("self-test: this is %s, expected %s\n", SCO_VERSION, tag.c_str()); return 2; }
-    if (Sha256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") { std::printf("self-test: SHA-256 broken\n"); return 3; }
-    if (!IsFile(here + L"\\dinput8.dll")) { std::printf("self-test: no dinput8.dll beside sc-offline.exe\n"); return 4; }
-    std::printf("self-test: sc-offline %s ok\n", SCO_VERSION);
-    return 0;
-}
-
-#ifdef SCO_UPDATE_TEST
-// D6 test hook, test builds only: --apply-zip <zip> <tag> <sha256> runs the real stage, verify,
-// swap and self-test path against a local zip instead of a download. Exit 0 applied, 1 refused or
-// rolled back. SCO_TEST_FAIL_AFTER=N fails the swap after N files.
-static int ApplyZipForTest(const wstring& zipPath, const wstring& tagW, const wstring& shaW) {
-    const wstring here = ExeDir();
-    CreateDirectoryW((here + L"\\data").c_str(), nullptr);
-    OpenLog(here + L"\\data", true, "test --apply-zip");
-    SettlePreviousUpdate(here);
-    const std::string tag = Narrow(tagW);
-    std::string sha = Narrow(shaW), zip;
-    for (char& c : sha) c = (char)tolower((unsigned char)c);
-    if (!ReadAll(zipPath, zip)) { Out("[!] can't read %ls\n", zipPath.c_str()); return kExitError; }
-    if (Sha256(zip) != sha) { Out("[!] the zip doesn't match the given SHA-256; nothing changed\n"); return kExitError; }
-    const wstring root = StageRoot(here);
-    RemoveTree(root + L"\\staged"); RemoveTree(root + L"\\new");
-    CreateDirectoryW(root.c_str(), nullptr);
-    const wstring copy = root + L"\\sc-offline-" + tagW + L".zip";
-    if (!WriteAll(copy, zip)) { Out("[!] couldn't copy the zip\n"); return kExitError; }
-    const bool staged = StageZip(root, copy, tag);
-    DeleteFileW(copy.c_str());
-    if (!staged) { RemoveTree(root + L"\\staged"); RemoveTree(root + L"\\new"); return kExitError; }
-    return InstallStaged(here, tag) ? kExitOk : kExitError;
-}
-#endif
-
-// Starts the new launcher with the same arguments and waits for it, so a double-clicked window
-// stays open; this process then exits with its code. (While this old exe waits, its .update-old
-// copy is locked, so the cleanup of data\update finishes on the run after.)
-static void Relaunch(const wstring& here) {
-    const wstring exe = here + L"\\sc-offline.exe";
-    wstring cmd = GetCommandLineW();
-    STARTUPINFOW si{}; si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, here.c_str(), &si, &pi)) {
-        Out("[!] couldn't start the new launcher (error %lu); run sc-offline.exe again\n", GetLastError());
-        PauseIfOwnConsole();
-        ExitProcess(kExitError);
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);   // keep this console open for the new launcher
-    DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    ExitProcess(code);
-}
-
-
-// --- Discord Rich Presence (issue #34) ------------------------------------------------------
-// While the game runs, the player's Discord profile shows "Playing sc-offline" with the version,
-// the time played and two buttons (the Discord server and the download page). It talks to the
-// Discord app on this PC through its local pipe, \\.\pipe\discord-ipc-N: each frame is an int32
-// opcode, an int32 length and JSON. No SDK, no client secret, no network. Best effort: when
-// Discord isn't running (or under Wine/Proton, where the pipe usually isn't there) nothing happens
-// and play never waits on it. Discord clears the activity when the pipe closes.
-
-static const char* kDiscordAppId = "1557514943308242955";   // public; the sc-offline app's assets live there
-static const char* kDiscordInvite = "https://discord.gg/NJKeVfYCCC";
-
-struct Presence { HANDLE stop = nullptr, thread = nullptr; DWORD gamePid = 0; long long start = 0; };
-
-static bool PipeWrite(HANDLE pipe, uint32_t op, const std::string& json) {
-    std::string frame(8, '\0');
-    const uint32_t len = static_cast<uint32_t>(json.size());
-    memcpy(&frame[0], &op, 4); memcpy(&frame[4], &len, 4);
-    frame += json;
-    DWORD put = 0;
-    return WriteFile(pipe, frame.data(), static_cast<DWORD>(frame.size()), &put, nullptr) && put == frame.size();
-}
-
-// Reads one frame, giving up after timeoutMs so a stuck Discord can't hold the launcher.
-static bool PipeRead(HANDLE pipe, uint32_t& op, std::string& json, DWORD timeoutMs) {
-    const ULONGLONG until = GetTickCount64() + timeoutMs;
-    auto readN = [&](char* buf, DWORD n) {
-        DWORD have = 0;
-        while (have < n) {
-            DWORD avail = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) return false;
-            if (!avail) { if (GetTickCount64() > until) return false; Sleep(20); continue; }
-            DWORD got = 0;
-            if (!ReadFile(pipe, buf + have, std::min<DWORD>(avail, n - have), &got, nullptr) || !got) return false;
-            have += got;
-        }
-        return true;
-    };
-    char head[8];
-    if (!readN(head, 8)) return false;
-    uint32_t len = 0; memcpy(&op, head, 4); memcpy(&len, head + 4, 4);
-    if (len > 65536) return false;
-    json.assign(len, '\0');
-    return len == 0 || readN(&json[0], len);
-}
-
-static HANDLE ConnectDiscord() {
-    for (int i = 0; i < 10; ++i) {
-        const wstring name = L"\\\\.\\pipe\\discord-ipc-" + std::to_wstring(i);
-        HANDLE h = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h != INVALID_HANDLE_VALUE) return h;
-    }
-    return INVALID_HANDLE_VALUE;
-}
-
-// The SET_ACTIVITY command. Every value is ours (version, URLs), so nothing needs JSON escaping.
-static std::string ActivityJson(DWORD pid, long long start) {
-    char buf[1400];
-    std::snprintf(buf, sizeof(buf),
-        "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%lld\",\"args\":{\"pid\":%lu,\"activity\":{"
-        "\"details\":\"Star Citizen offline mod\",\"state\":\"v%s \xC2\xB7 single player\","
-        "\"timestamps\":{\"start\":%lld},"
-        "\"assets\":{\"large_image\":\"sc_offline\",\"large_text\":\"sc-offline v%s\","
-        "\"small_image\":\"sc_offline_small\",\"small_text\":\"Offline, single player\"},"
-        "\"buttons\":[{\"label\":\"Join the Discord\",\"url\":\"%s\"},"
-        "{\"label\":\"Get sc-offline\",\"url\":\"https://github.com/scubamount/sc-offline/releases/latest\"}]}}}",
-        start, (unsigned long)pid, SCO_VERSION, start, SCO_VERSION, kDiscordInvite);
-    return buf;
-}
-
-// Connects, sets the activity and holds the pipe until stop is signalled. Discord may start
-// after the game, so it tries again every 15 s; one launcher.log line says how it went.
-static DWORD WINAPI PresenceThread(void* arg) {
-    Presence& p = *static_cast<Presence*>(arg);
-    bool told = false;
-    while (true) {
-        HANDLE pipe = ConnectDiscord();
-        if (pipe != INVALID_HANDLE_VALUE) {
-            uint32_t op = 0; std::string reply;
-            const bool ready = PipeWrite(pipe, 0, std::string("{\"v\":1,\"client_id\":\"") + kDiscordAppId + "\"}") &&
-                               PipeRead(pipe, op, reply, 3000) && reply.find("\"READY\"") != std::string::npos;
-            const bool set = ready && PipeWrite(pipe, 1, ActivityJson(p.gamePid, p.start)) &&
-                             PipeRead(pipe, op, reply, 3000) && reply.find("\"ERROR\"") == std::string::npos;
-            if (set) {
-                Out("Discord:  showing \"Playing sc-offline\" on your profile (discord_presence = off hides it)\n");
-                // Hold the pipe open (closing it clears the status); drain anything Discord sends.
-                while (WaitForSingleObject(p.stop, 1000) == WAIT_TIMEOUT) {
-                    DWORD avail = 0;
-                    if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) break;   // Discord quit
-                    if (avail && !PipeRead(pipe, op, reply, 1000)) break;
-                }
-                CloseHandle(pipe);
-                if (WaitForSingleObject(p.stop, 0) == WAIT_OBJECT_0) return 0;
-                told = true;
-                continue;   // Discord restarted: try again
-            }
-            CloseHandle(pipe);
-            if (!told) { Out("Discord:  couldn't set the status (%s)\n", ready ? "Discord refused it" : "no answer"); told = true; }
-        } else if (!told) {
-            if (g_log) { std::fprintf(g_log, "Discord:  not running; no status shown\n"); std::fflush(g_log); }
-            told = true;
-        }
-        if (WaitForSingleObject(p.stop, 15000) == WAIT_OBJECT_0) return 0;
-    }
-}
-
-static void StartPresence(Presence& p, DWORD gamePid) {
-    p.gamePid = gamePid;
-    p.start = static_cast<long long>(std::time(nullptr));
-    p.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (p.stop) p.thread = CreateThread(nullptr, 0, PresenceThread, &p, 0, nullptr);
-}
-
-static void StopPresence(Presence& p) {
-    if (!p.thread) return;
-    SetEvent(p.stop);
-    WaitForSingleObject(p.thread, 5000);
-    CloseHandle(p.thread); CloseHandle(p.stop);
-    p.thread = p.stop = nullptr;
-}
-
-// Sets `key = value` in sc-offline.ini: replaces the first uncommented line for the key, or appends one.
-static bool SetIniValue(const wstring& iniPath, const char* key, const char* value) {
-    std::string text;
-    ReadAll(iniPath, text);
-    const std::string line = std::string(key) + " = " + value;
-    for (size_t pos = 0; pos < text.size();) {
-        size_t nl = text.find('\n', pos); if (nl == std::string::npos) nl = text.size();
-        const size_t b = text.find_first_not_of(" \t", pos);
-        if (b < nl && !_strnicmp(text.c_str() + b, key, strlen(key))) {
-            size_t after = b + strlen(key);
-            while (after < nl && (text[after] == ' ' || text[after] == '\t')) ++after;
-            if (after < nl && text[after] == '=') {
-                size_t end = nl; if (end > pos && text[end - 1] == '\r') --end;
-                return WriteAll(iniPath, text.substr(0, pos) + line + text.substr(end));
-            }
-        }
-        pos = nl + 1;
-    }
-    if (!text.empty() && text.back() != '\n') text += "\r\n";
-    return WriteAll(iniPath, text + "\r\n# Show \"Playing sc-offline\" on your Discord profile while the game runs. on or off.\r\n" + line + "\r\n");
 }
 
 // --- Crash reports (issue #18) -------------------------------------------------------------
@@ -1938,7 +1004,7 @@ static void OfferCrashReport(const wstring& here, const wstring& channelDir, ULO
         zipped ? "" : "; tar.exe failed, so it is a folder - zip it yourself");
     Out("          Look through it before you share it: the redaction covers handle, IDs and user name only.\n");
     if (!AskYes("Open the bug form in your browser (you attach the zip there)?")) return;
-    const std::string url = "https://github.com/scubamount/sc-offline/issues/new?template=bug.yml&title=" +
+    const std::string url = "https://github.com/trofdev/sc-offline/issues/new?template=bug.yml&title=" +
         UrlEncode("Crash: ") + "&version=" + UrlEncode(SCO_VERSION) + "&game=" + UrlEncode(gameBuild) +
         "&os=" + UrlEncode(OnWine() ? "Linux (Wine/Proton)" : "Windows");
     ShellExecuteW(nullptr, L"open", Wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1960,7 +1026,7 @@ static const char*    kEacHost      = "modules-cdn.eac-prod.on.epicgames.com";
 static const char*    kHostsTag     = "# added by sc-offline, removed when the game closes";
 static const wchar_t* kFirewallRule = L"sc-offline: block StarCitizen.exe";
 // Issue #17: while you play, also block the RSI Launcher and CIG's crash uploader, so neither
-// reports a modded session. sc-offline.exe itself stays online (self-update, #14).
+// reports a modded session. sc-offline.exe makes no network connections.
 static const wchar_t* kLauncherRule = L"sc-offline: block RSI Launcher.exe";
 static const wchar_t* kCrashRule    = L"sc-offline: block CrashHandler.exe";
 
@@ -2345,13 +1411,13 @@ static CheckResult SelfChecks(const wstring& here, const Config& cfg, const Game
 // set, so the window and the CLI share one code path: the child's output is streamed into the box,
 // and its [y/N] questions are answered by the Yes/No buttons through its stdin.
 
-enum { kIdPlay = 101, kIdStatus, kIdUpdate, kIdInstall, kIdUninstall, kIdSettings, kIdLogs, kIdYes, kIdNo,
-       kIdOutput, kIdLight, kIdLightText, kIdPrompt, kIdDiscord };
+enum { kIdPlay = 101, kIdStatus, kIdInstall, kIdUninstall, kIdSettings, kIdLogs, kIdYes, kIdNo,
+       kIdOutput, kIdLight, kIdLightText, kIdPrompt };
 enum { kMsgOutput = WM_APP + 1, kMsgDone, kTimerLight = 1 };
 
 struct Gui {
     HWND wnd = nullptr, out = nullptr, light = nullptr, lightText = nullptr, prompt = nullptr, yes = nullptr, no = nullptr;
-    HWND buttons[5] = {};
+    HWND buttons[4] = {};
     HANDLE child = nullptr, childIn = nullptr;
     std::wstring tail;           // the end of the output, to spot a [y/N] question
     std::wstring running;        // command being run, "" when idle
@@ -2499,9 +1565,8 @@ static void Layout(HWND wnd) {
     MoveWindow(g.light, m, m, 18, 18, TRUE);
     MoveWindow(g.lightText, m + 28, m - 2, W - 2 * m - 28 - 190, 40, TRUE);   // 190: the watermark
     int x = m; const int y = m + 46;
-    const int widths[] = { 90, 80, 80, 80, 90 };
-    for (int i = 0; i < 5; ++i) { MoveWindow(g.buttons[i], x, y, widths[i], bh, TRUE); x += widths[i] + 6; }
-    MoveWindow(GetDlgItem(wnd, kIdDiscord), x + 12, y + 7, 170, 20, TRUE);
+    const int widths[] = { 90, 80, 80, 90 };
+    for (int i = 0; i < 4; ++i) { MoveWindow(g.buttons[i], x, y, widths[i], bh, TRUE); x += widths[i] + 6; }
     MoveWindow(GetDlgItem(wnd, kIdLogs), W - m - 100, y, 100, bh, TRUE);
     MoveWindow(GetDlgItem(wnd, kIdSettings), W - m - 100 - 6 - 110, y, 110, bh, TRUE);
     const int qy = H - m - bh;
@@ -2523,17 +1588,11 @@ static LRESULT CALLBACK GuiProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         };
         g.light = mk(L"STATIC", L"", SS_NOTIFY, kIdLight);
         g.lightText = mk(L"STATIC", L"", 0, kIdLightText);
-        const wchar_t* names[] = { L"Play", L"Status", L"Update", L"Install", L"Uninstall" };
-        for (int i = 0; i < 5; ++i) g.buttons[i] = mk(L"BUTTON", names[i], BS_PUSHBUTTON | WS_TABSTOP, kIdPlay + i);
+        const wchar_t* names[] = { L"Play", L"Status", L"Install", L"Uninstall" };
+        for (int i = 0; i < 4; ++i) g.buttons[i] = mk(L"BUTTON", names[i], BS_PUSHBUTTON | WS_TABSTOP, kIdPlay + i);
         SendMessageW(g.buttons[0], BM_SETSTYLE, BS_DEFPUSHBUTTON, TRUE);
         mk(L"BUTTON", L"Open settings", BS_PUSHBUTTON | WS_TABSTOP, kIdSettings);
         mk(L"BUTTON", L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, kIdLogs);
-        {   // Discord status toggle: writes discord_presence to sc-offline.ini; the next Play uses it.
-            Config cfg;
-            FILE* saved = g_log; g_log = nullptr; ReadConfig(g.here + L"\\sc-offline.ini", cfg); g_log = saved;
-            HWND cb = mk(L"BUTTON", L"Show on Discord", BS_AUTOCHECKBOX | WS_TABSTOP, kIdDiscord);
-            SendMessageW(cb, BM_SETCHECK, cfg.discordPresence ? BST_CHECKED : BST_UNCHECKED, 0);
-        }
         g.out = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                                 0, 0, 10, 10, wnd, (HMENU)(INT_PTR)kIdOutput, nullptr, nullptr);
         SendMessageW(g.out, WM_SETFONT, (WPARAM)g.mono, TRUE);
@@ -2545,7 +1604,6 @@ static LRESULT CALLBACK GuiProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetWindowTextW(g.out, (L"sc-offline " + Wide(SCO_VERSION) + L" - Star Citizen offline mod\r\n\r\n"
             L"Play       add the mod, start the game, take the mod out when it closes\r\n"
             L"Status     check the setup; changes nothing\r\n"
-            L"Update     check GitHub for a newer sc-offline\r\n"
             L"Install    add the mod and leave it (Uninstall before going online)\r\n"
             L"Uninstall  take the mod out and undo the PC changes\r\n\r\n"
             L"The light above tells you whether it is safe to go back online.\r\n").c_str());
@@ -2583,20 +1641,11 @@ static LRESULT CALLBACK GuiProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case kIdPlay: RunCommand(L"play"); return 0;
         case kIdStatus: RunCommand(L"status"); return 0;
-        case kIdUpdate: RunCommand(L"update"); return 0;
         case kIdInstall: RunCommand(L"install"); return 0;
         case kIdUninstall: RunCommand(L"uninstall"); return 0;
         case kIdYes: Answer(true); return 0;
         case kIdNo: Answer(false); return 0;
         case kIdSettings: ShellExecuteW(wnd, L"open", L"notepad.exe", (L"\"" + g.here + L"\\sc-offline.ini\"").c_str(), nullptr, SW_SHOWNORMAL); return 0;
-        case kIdDiscord: {
-            const bool on = SendMessageW(GetDlgItem(wnd, kIdDiscord), BM_GETCHECK, 0, 0) == BST_CHECKED;
-            if (SetIniValue(g.here + L"\\sc-offline.ini", "discord_presence", on ? "on" : "off"))
-                AppendOutput(on ? L"\nDiscord status on: your profile shows \"Playing sc-offline\" from the next Play.\n"
-                                : L"\nDiscord status off: from the next Play, nothing is shown on Discord.\n");
-            else AppendOutput(L"\n[!] couldn't write sc-offline.ini; set discord_presence there by hand.\n");
-            return 0;
-        }
         case kIdLogs: { const wstring d = g.here + L"\\data"; CreateDirectoryW(d.c_str(), nullptr);
                         ShellExecuteW(wnd, L"open", d.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
         }
@@ -2608,12 +1657,6 @@ static LRESULT CALLBACK GuiProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g.childIn) { CloseHandle(g.childIn); g.childIn = nullptr; }
         ShowWindow(g.prompt, SW_HIDE); ShowWindow(g.yes, SW_HIDE); ShowWindow(g.no, SW_HIDE);
         g.running.clear();
-        if (code == kExitRestart) {
-            wchar_t self[MAX_PATH * 2]; GetModuleFileNameW(nullptr, self, ARRAYSIZE(self));
-            ShellExecuteW(nullptr, L"open", self, nullptr, g.here.c_str(), SW_SHOWNORMAL);
-            DestroyWindow(wnd);
-            return 0;
-        }
         AppendOutput(code == 0 ? L"\n[done]\n" : L"\n[finished with exit code " + std::to_wstring(code) + L"; see above]\n");
         RefreshLight();
         return 0;
@@ -2664,7 +1707,6 @@ static const char* kUsage =
     "  install    copy the mod in and leave it there; run `uninstall` before going online\n"
     "  uninstall  take the mod out and restore anything it replaced\n"
     "  status     check the setup and report; changes nothing\n"
-    "  update     check GitHub for a newer sc-offline and offer to install it (saves and ini kept)\n"
     "  help       show this\n"
     "\n"
     "  --game <folder>   your StarCitizen, LIVE or Bin64 folder (else sc-offline.ini, else searched)\n"
@@ -2676,10 +1718,6 @@ static const char* kUsage =
     "exit codes: 0 ok, 1 error, 2 Easy Anti-Cheat active, 3 the game is running\n";
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc == 3 && !_wcsicmp(argv[1], L"--self-test")) return SelfTest(Narrow(argv[2]));
-#ifdef SCO_UPDATE_TEST
-    if (argc == 5 && !_wcsicmp(argv[1], L"--apply-zip")) return ApplyZipForTest(argv[2], argv[3], argv[4]);
-#endif
     if (argc == 7 && !_wcsicmp(argv[1], L"--helper"))
         return Helper(argv[2], argv[3], wcstoul(argv[4], nullptr, 10), argv[5], argv[6]);
     // Double-clicked with no arguments: the window (issue #20). From a terminal, or with any
@@ -2690,8 +1728,6 @@ int wmain(int argc, wchar_t** argv) {
     if (GuiChild()) { std::setvbuf(stdout, nullptr, _IONBF, 0); SetConsoleOutputCP(CP_UTF8); }
     if (argc == 4 && !_wcsicmp(argv[1], L"--delete-logs"))
         return DeleteSessionLogs(argv[2], _wcstoui64(argv[3], nullptr, 10));
-    if (argc == 4 && !_wcsicmp(argv[1], L"--elevated-update"))
-        return ElevatedUpdate(ExeDir(), argv[2], argv[3]);   // S4: no network as administrator
 
     wstring command = L"play", gameArg;
     bool dry = false, skipEac = false, sawCommand = false;
@@ -2704,7 +1740,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (!_wcsicmp(a, L"--console")) {}
         else if (!_wcsicmp(a, L"--skip-eac-check")) skipEac = true;
         else if (!sawCommand && (!_wcsicmp(a, L"play") || !_wcsicmp(a, L"install") || !_wcsicmp(a, L"uninstall") ||
-                                 !_wcsicmp(a, L"status") || !_wcsicmp(a, L"update") || !_wcsicmp(a, L"help"))) {
+                                 !_wcsicmp(a, L"status") || !_wcsicmp(a, L"help"))) {
             command = a; sawCommand = true;
         } else if (!_wcsicmp(a, L"--help") || !_wcsicmp(a, L"-h") || !_wcsicmp(a, L"/?")) {
             command = L"help"; sawCommand = true;
@@ -2727,36 +1763,8 @@ int wmain(int argc, wchar_t** argv) {
     if (!CanWriteTo(data))
         Out("[!] this folder (%ls) can't be written without administrator rights, so the mod can't save\n"
             "    your wallet or places. Move the sc-offline folder out of Program Files, e.g. to your Desktop.\n", here.c_str());
-    if (!dry) SettlePreviousUpdate(here);
     Config cfg;
     if (!ReadConfig(here + L"\\sc-offline.ini", cfg)) Out("[i] no sc-offline.ini next to this exe; using defaults\n");
-
-    // 0. Updates (issue #14). Never blocks play: no network, a timeout or any odd reply is just skipped.
-    if (command == L"update" || (cfg.checkUpdates && !dry && (command == L"play" || command == L"status"))) {
-        const bool explicitUpdate = command == L"update";
-        std::string why;
-        const UpdateInfo u = CheckLatest(explicitUpdate ? 15000 : 3000, cfg.prereleases, &why);
-        if (u.tag.empty()) {
-            if (explicitUpdate) { Out("Update:   %s\n", why.c_str()); return why.rfind("up to date", 0) == 0 ? kExitOk : kExitError; }
-        } else {
-            Out("Update:   sc-offline %s is available (you have %s)\n", u.tag.c_str(), SCO_VERSION);
-            if (command == L"status") Out("          run `sc-offline.exe update` to install it\n");
-            else if (dry) Out("[dry-run] would download %s, check its SHA-256 and replace the program files\n", u.zipName.c_str());
-            else if (GameRunning()) Out("[!] close the game before updating\n");
-            else if (!OwnsConsoleInput()) Out("          (not asking: no console to answer in)\n");
-            else if (AskYes("Update now? Your saves and sc-offline.ini are kept.")) {
-                if (ApplyUpdate(here, u)) {
-                    if (GuiChild()) { Out("[i] restarting sc-offline with the new version\n"); return kExitRestart; }
-                    Out("[i] starting the new version\n\n");
-                    if (g_log) { std::fclose(g_log); g_log = nullptr; }
-                    Relaunch(here);
-                }
-                if (explicitUpdate) return Fail("update failed; your current version is unchanged");
-            } else Out("[i] not updating\n");
-        }
-        if (explicitUpdate) return kExitOk;
-        Out("\n");
-    }
 
     // 1. Find the game.
     wstring bin;
@@ -2891,12 +1899,9 @@ int wmain(int argc, wchar_t** argv) {
     } else {
         if (!checks.gameBuild.empty()) WriteAll(data + L"\\game-build.txt", checks.gameBuild + "\n");
         Out("\nPlaying. When the game closes, the mod is removed from Bin64.\n");
-        Presence presence;
-        if (cfg.discordPresence) StartPresence(presence, pi.dwProcessId);
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         while (GameRunning()) Sleep(2000);   // the game can hand over to a second StarCitizen.exe
-        StopPresence(presence);
         if (cfg.crashReports && OwnsConsoleInput()) OfferCrashReport(here, ParentDir(bin), sessionStart, checks.gameBuild);
         if (cfg.cleanLogs && OwnsConsoleInput()) OfferToCleanLogs(ParentDir(bin), sessionStart);
         else if (cfg.cleanLogs) Out("Logs:     not asking (no console to answer in); run from a window to be asked\n");

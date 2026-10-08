@@ -11,7 +11,7 @@
 2. Turn off Easy Anti-Cheat, the Linux way:
    - add `127.0.0.1 modules-cdn.eac-prod.on.epicgames.com` to `/etc/hosts`;
    - if `EasyAntiCheat_EOS.exe` exists under `drive_c/Program Files (x86)/EasyAntiCheat_EOS/` in your prefix, rename it.
-3. Extract the release zip anywhere, then run:
+3. Put `sc-offline.exe`, `dinput8.dll`, `sc-offline.ini`, `sc-offline.sh` and `data/` from your own build in one folder (see the [README](../README.md#build-it-yourself)), then run:
 
    ```bash
    ./sc-offline.sh

@@ -11,11 +11,11 @@ Thanks for helping. sc-offline is a Star Citizen offline mod: a single-player mo
 
 ## Reporting a bug
 
-Use the [Bug report](https://github.com/scubamount/sc-offline/issues/new/choose) form. Include the output of `sc-offline.exe status` and attach `data/launcher.log`, `data/mod.log` and the game's `Game.log`. One problem per issue. Check [Troubleshooting](README.md#troubleshooting) first.
+Use the [Bug report](https://github.com/trofdev/sc-offline/issues/new/choose) form. Include the output of `sc-offline.exe status` and attach `data/launcher.log`, `data/mod.log` and the game's `Game.log`. One problem per issue. Check [Troubleshooting](README.md#troubleshooting) first.
 
-For security problems (the self-update, the administrator helper, a change the launcher doesn't undo), **don't open a public issue**; see [SECURITY.md](SECURITY.md).
+For security problems (the administrator helper, a change the launcher doesn't undo), **don't open a public issue**; see [SECURITY.md](SECURITY.md).
 
-Questions and ideas: open an issue or ask in the [Discord](https://discord.gg/NJKeVfYCCC).
+Questions and ideas: open an issue.
 
 ## Making a change
 
@@ -24,7 +24,6 @@ Questions and ideas: open an issue or ask in the [Discord](https://discord.gg/NJ
 3. Build and check as described in [docs/build.md](docs/build.md):
    - Windows: build **Release | x64** with Visual Studio.
    - macOS or Linux: `tools/check.sh` must report `0 new` diagnostics. It isn't a build; CI's MSVC build is the real check.
-   - Touching the self-update: run `tools/update-test/run.sh` under Wine (see [docs/build.md](docs/build.md#self-update-tests-under-wine)).
 4. Test in game if you can, and say in the PR what you tested and what you didn't.
 5. Update the docs your change affects (`README.md`, `docs/`, `sc-offline.ini` comments) in the same PR.
 6. Add a line under the top section of [CHANGELOG.md](CHANGELOG.md) for anything a player would notice.
@@ -37,10 +36,6 @@ PRs are squash-merged. Keep one change per PR.
 - Match the surrounding code: C++ in `src/` (the mod) and `launcher/` (the launcher), no new dependencies without discussing it first.
 - In `src/`, don't put `__try` in a function that owns objects with destructors (such as `std::string`); MSVC rejects it (C2712) and `tools/check.sh` screens for it.
 - Write messages players will read in plain words: what happened and what to do.
-
-## Releases
-
-Maintainers tag releases; contributors don't need to bump versions. See [Release policy](docs/build.md#release-policy).
 
 ## License
 
